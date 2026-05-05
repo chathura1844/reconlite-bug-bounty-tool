@@ -1,0 +1,2 @@
+http://www.lifeout.com/robots.txt
+https://www.lifeout.com/robots.txt

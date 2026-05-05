@@ -1,0 +1,2 @@
+https://example.com/login.php
+https://example.com/search?q=test

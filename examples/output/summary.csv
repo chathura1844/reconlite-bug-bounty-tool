@@ -1,0 +1,7 @@
+category,severity,count,hint
+all_parameterized_urls,INFO,17,General parameterized URLs for broad manual review.
+auth_pages,HIGH,12,"Check login errors, reset flow, token handling, CSRF, and rate limiting."
+xss_candidates,HIGH,11,"Check reflection and context: HTML text, attribute, script, or URL context."
+redirect_candidates,HIGH,10,Check if external domains are accepted; test safely and avoid harmful redirects.
+sensitive_files,LOW,2,Confirm exposure of public files only; do not access private data.
+idor_candidates,HIGH,1,Check access control using your own authorized test accounts only.

@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""
+ReconLite v2 - Bug Bounty URL Classifier
+
+A safe reconnaissance helper that reads URLs from tools like gau, katana, or waybackurls
+and organizes them into useful bug bounty categories with priority scoring.
+
+Input modes:
+  reconlite -i urls.txt -o recon-output --domain example.com
+  gau example.com | reconlite -o recon-output --domain example.com
+  katana -u https://example.com -silent | reconlite -o recon-output
+
+It does NOT exploit anything. It only classifies URLs for manual review.
+
+Author: Chathura Chamantha
+"""
+
+import argparse
+import csv
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+from urllib.parse import parse_qs, urlparse
+
+
+VERSION = "2.0.0"
+AUTHOR = "Chathura Chamantha"
+
+
+class Color:
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    GREEN = "\033[92m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def c(text: str, color: str, enabled: bool = True) -> str:
+    return f"{color}{text}{Color.RESET}" if enabled else text
+
+
+CATEGORIES = {
+    "auth_pages": {
+        "severity": "HIGH",
+        "weight": 90,
+        "params": ["login", "password", "token", "reset", "email"],
+        "paths": ["login", "logout", "register", "signup", "signin", "auth", "oauth", "sso", "forgot", "reset", "password", "accountcreds", "getaccountcreds"],
+        "hint": "Check login errors, reset flow, token handling, CSRF, and rate limiting.",
+    },
+    "redirect_candidates": {
+        "severity": "HIGH",
+        "weight": 85,
+        "params": ["url", "u", "redirect", "redirect_url", "next", "return", "returnurl", "return_url", "continue", "dest", "destination", "target", "r", "referer", "ref"],
+        "paths": ["redirect", "jump", "go", "out", "external", "callback"],
+        "hint": "Check if external domains are accepted; test safely and avoid harmful redirects.",
+    },
+    "xss_candidates": {
+        "severity": "HIGH",
+        "weight": 80,
+        "params": ["q", "s", "search", "query", "keyword", "term", "name", "message", "comment", "title", "text", "content", "return", "referer", "ref"],
+        "paths": ["search", "comment", "feedback", "contact", "support", "profile", "login"],
+        "hint": "Check reflection and context: HTML text, attribute, script, or URL context.",
+    },
+    "idor_candidates": {
+        "severity": "HIGH",
+        "weight": 78,
+        "params": ["id", "uid", "user", "user_id", "userid", "account", "account_id", "profile", "profile_id", "member", "member_id", "order", "order_id", "invoice", "invoice_id", "file_id", "doc", "doc_id", "pid", "cid"],
+        "paths": ["user", "account", "profile", "member", "order", "invoice", "document", "file", "download"],
+        "hint": "Check access control using your own authorized test accounts only.",
+    },
+    "api_endpoints": {
+        "severity": "MEDIUM",
+        "weight": 65,
+        "params": [],
+        "paths": ["api", "graphql", "rest", "v1", "v2", "v3", "ajax", "json", "endpoint", "webhook"],
+        "hint": "Review methods, auth requirements, CORS, schema exposure, and verbose errors.",
+    },
+    "ssrf_candidates": {
+        "severity": "MEDIUM",
+        "weight": 62,
+        "params": ["url", "uri", "path", "dest", "destination", "callback", "webhook", "feed", "proxy", "site", "image", "img", "load", "fetch", "resource"],
+        "paths": ["proxy", "fetch", "load", "image", "preview", "webhook", "callback", "import"],
+        "hint": "Use safe collaborator checks only where program rules allow it.",
+    },
+    "file_upload_download": {
+        "severity": "MEDIUM",
+        "weight": 58,
+        "params": ["file", "filename", "path", "download", "upload", "attachment", "document", "image", "img", "media", "export"],
+        "paths": ["upload", "uploads", "download", "downloads", "files", "attachments", "media", "export", "import"],
+        "hint": "Review upload restrictions and download access control safely.",
+    },
+    "admin_panels": {
+        "severity": "MEDIUM",
+        "weight": 55,
+        "params": [],
+        "paths": ["admin", "administrator", "dashboard", "panel", "manage", "management", "backend", "cpanel", "staff", "moderator"],
+        "hint": "Verify exposure only; do not brute-force or bypass authentication.",
+    },
+    "sql_injection_candidates": {
+        "severity": "MEDIUM",
+        "weight": 50,
+        "params": ["id", "uid", "user", "cat", "category", "product", "product_id", "item", "page", "post", "article", "sort", "order", "filter", "where", "select"],
+        "paths": ["product", "category", "search", "item", "article", "post", "view", "details"],
+        "hint": "Perform only safe, non-destructive validation within program scope.",
+    },
+    "sensitive_files": {
+        "severity": "LOW",
+        "weight": 40,
+        "params": [],
+        "paths": [".env", "config", "backup", "bak", "old", "sql", "db", "dump", "phpinfo", "debug", "test", "staging", "dev", "robots.txt", "sitemap.xml", ".git", ".svn"],
+        "hint": "Confirm exposure of public files only; do not access private data.",
+    },
+}
+
+
+GENERIC_CATEGORY = "all_parameterized_urls"
+
+
+def banner(no_color: bool = False) -> None:
+    art = r"""
+   ____                  _      _     _ _       
+  |  _ \ ___  ___ ___  _| |    (_)___| | |_ ___ 
+  | |_) / _ \/ __/ _ \| | |    | / __| | __/ _ \
+  |  _ <  __/ (_| (_) | | |___ | \__ \ | ||  __/
+  |_| \_\___|\___\___/|_|_____|/ |___/_|\__\___|
+                              |__/              
+"""
+    print(c(art, Color.CYAN, not no_color))
+    print(c(f"   ReconLite v{VERSION} | Bug Bounty URL Classifier", Color.BOLD, not no_color))
+    print(c(f"   by {AUTHOR}\n", Color.BLUE, not no_color))
+
+
+def normalize_url_line(line: str) -> str:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return ""
+    match = re.search(r"https?://[^\s'\"<>]+", line)
+    if match:
+        return match.group(0).rstrip(")],.;")
+    return ""
+
+
+def load_urls_from_file(input_file: str) -> List[str]:
+    path = Path(input_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+    return dedupe([normalize_url_line(line) for line in path.read_text(errors="ignore").splitlines()])
+
+
+def load_urls_from_stdin() -> List[str]:
+    return dedupe([normalize_url_line(line) for line in sys.stdin])
+
+
+def dedupe(items: List[str]) -> List[str]:
+    return list(dict.fromkeys([item for item in items if item]))
+
+
+def get_params(url: str) -> Set[str]:
+    parsed = urlparse(url)
+    params = set(parse_qs(parsed.query, keep_blank_values=True).keys())
+    return {p.lower() for p in params}
+
+
+def get_path_tokens(url: str) -> Set[str]:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    tokens = set(re.split(r"[^a-zA-Z0-9_.-]+", path))
+    return {t for t in tokens if t}
+
+
+def belongs_to_domain(url: str, domain: str) -> bool:
+    if not domain:
+        return True
+    host = urlparse(url).netloc.lower().split(":")[0]
+    domain = domain.lower().strip()
+    return host == domain or host.endswith("." + domain)
+
+
+def classify_url(url: str) -> List[str]:
+    params = get_params(url)
+    path_tokens = get_path_tokens(url)
+    path_full = urlparse(url).path.lower()
+    matched = []
+
+    for category, rules in CATEGORIES.items():
+        rule_params = set(p.lower() for p in rules["params"])
+        rule_paths = set(p.lower() for p in rules["paths"])
+        param_match = bool(params.intersection(rule_params))
+        path_match = any(token in path_tokens or token in path_full for token in rule_paths)
+        if param_match or path_match:
+            matched.append(category)
+
+    if urlparse(url).query:
+        matched.append(GENERIC_CATEGORY)
+
+    return dedupe(matched)
+
+
+def classify_urls(urls: List[str], domain: str = "") -> Dict[str, Set[str]]:
+    results: Dict[str, Set[str]] = defaultdict(set)
+    for url in urls:
+        if not belongs_to_domain(url, domain):
+            continue
+        for category in classify_url(url):
+            results[category].add(url)
+    return results
+
+
+def severity_color(severity: str) -> str:
+    if severity == "HIGH":
+        return Color.RED
+    if severity == "MEDIUM":
+        return Color.YELLOW
+    if severity == "LOW":
+        return Color.GREEN
+    return Color.BLUE
+
+
+def category_severity(category: str) -> str:
+    if category == GENERIC_CATEGORY:
+        return "INFO"
+    return CATEGORIES.get(category, {}).get("severity", "INFO")
+
+
+def category_weight(category: str) -> int:
+    if category == GENERIC_CATEGORY:
+        return 20
+    return int(CATEGORIES.get(category, {}).get("weight", 10))
+
+
+def category_hint(category: str) -> str:
+    if category == GENERIC_CATEGORY:
+        return "General parameterized URLs for broad manual review."
+    return CATEGORIES.get(category, {}).get("hint", "Manual review recommended.")
+
+
+def top_priority_urls(results: Dict[str, Set[str]], limit: int = 20) -> List[Tuple[int, str, str]]:
+    scored = []
+    seen = set()
+    for category, urls in results.items():
+        if category == GENERIC_CATEGORY:
+            continue
+        for url in urls:
+            key = (url, category)
+            if key in seen:
+                continue
+            seen.add(key)
+            score = category_weight(category)
+            # Bonus for URLs with multiple query parameters
+            params_count = len(get_params(url))
+            if params_count >= 2:
+                score += 8
+            elif params_count == 1:
+                score += 4
+            scored.append((score, category, url))
+    return sorted(scored, key=lambda x: x[0], reverse=True)[:limit]
+
+
+def write_outputs(results: Dict[str, Set[str]], output_dir: str, total_urls: int, domain: str = "", top_limit: int = 20) -> None:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    for category, urls in sorted(results.items()):
+        file_path = out / f"{category}.txt"
+        file_path.write_text("\n".join(sorted(urls)) + "\n", encoding="utf-8")
+
+    top_items = top_priority_urls(results, top_limit)
+    (out / "top_priority.txt").write_text("\n".join([f"[{score}] {category} -> {url}" for score, category, url in top_items]) + "\n", encoding="utf-8")
+
+    csv_path = out / "summary.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["category", "severity", "count", "hint"])
+        for category, urls in sorted(results.items(), key=lambda item: len(item[1]), reverse=True):
+            writer.writerow([category, category_severity(category), len(urls), category_hint(category)])
+
+    report_path = out / "report.md"
+    md = "# ReconLite v2 Report\n\n"
+    md += "## Summary\n\n"
+    md += f"- Tool version: **{VERSION}**\n"
+    md += f"- Author: **{AUTHOR}**\n"
+    md += f"- Total URLs loaded: **{total_urls}**\n"
+    if domain:
+        md += f"- Domain filter: **{domain}**\n"
+    md += f"- Categories with matches: **{len(results)}**\n\n"
+
+    md += "## Findings by Category\n\n"
+    md += "| Category | Severity | Count | Review Hint |\n"
+    md += "|---|---|---:|---|\n"
+    for category, urls in sorted(results.items(), key=lambda item: len(item[1]), reverse=True):
+        md += f"| `{category}` | **{category_severity(category)}** | {len(urls)} | {category_hint(category)} |\n"
+
+    md += "\n## Top Priority URLs\n\n"
+    if top_items:
+        md += "| Score | Category | URL |\n|---:|---|---|\n"
+        for score, category, url in top_items:
+            md += f"| {score} | `{category}` | `{url}` |\n"
+    else:
+        md += "No priority URLs found.\n"
+
+    md += "\n## Suggested Manual Workflow\n\n"
+    md += "1. Start with `top_priority.txt`.\n"
+    md += "2. Review `auth_pages.txt` for login, reset, and username enumeration issues.\n"
+    md += "3. Review `redirect_candidates.txt` for open redirect and redirect-based XSS.\n"
+    md += "4. Review `xss_candidates.txt` for reflected parameters and context.\n"
+    md += "5. Review `idor_candidates.txt` only with authorized test accounts.\n"
+    md += "6. Review `api_endpoints.txt` for auth, CORS, verbose errors, and schema exposure.\n\n"
+
+    md += "## Safety Note\n\n"
+    md += "ReconLite does not exploit targets. It only organizes URLs for ethical manual review within authorized scope.\n"
+    report_path.write_text(md, encoding="utf-8")
+
+
+def print_summary(results: Dict[str, Set[str]], total_urls: int, output_dir: str, no_color: bool = False, top_limit: int = 10) -> None:
+    banner(no_color)
+    print(c("Category Summary", Color.BOLD, not no_color))
+    print("-" * 72)
+    print(f"{'Severity':10} {'Category':28} {'Count':>8}  Hint")
+    print("-" * 72)
+
+    if not results:
+        print(c("No matches found. Try using more URLs from gau/katana/waybackurls.", Color.YELLOW, not no_color))
+        return
+
+    for category, urls in sorted(results.items(), key=lambda item: len(item[1]), reverse=True):
+        sev = category_severity(category)
+        sev_print = c(sev, severity_color(sev), not no_color)
+        print(f"{sev_print:18} {category:28} {len(urls):>8}  {category_hint(category)}")
+
+    print("\n" + c("Top Priority URLs", Color.BOLD, not no_color))
+    print("-" * 72)
+    top_items = top_priority_urls(results, top_limit)
+    if not top_items:
+        print("No top priority URLs found.")
+    else:
+        for score, category, url in top_items:
+            sev = category_severity(category)
+            print(f"[{score:3}] {c(sev, severity_color(sev), not no_color):15} {category:24} {url}")
+
+    print("\n" + c("Output", Color.BOLD, not no_color))
+    print("-" * 72)
+    print(f"Total URLs loaded : {total_urls}")
+    print(f"Output directory  : {output_dir}")
+    print(f"Report            : {output_dir}/report.md")
+    print(f"Top priorities    : {output_dir}/top_priority.txt")
+    print(f"CSV summary       : {output_dir}/summary.csv")
+    print(f"Category files    : {output_dir}/*.txt\n")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Classify recon URLs into bug bounty review categories with priority scoring.",
+        epilog="Examples:\n"
+               "  reconlite -i urls.txt -o recon-output --domain example.com\n"
+               "  gau example.com | reconlite -o recon-output --domain example.com\n"
+               "  katana -u https://example.com -silent | reconlite -o recon-output\n"
+               "  reconlite -i urls.txt --top 30 --no-color",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-i", "--input", help="Input file containing URLs from gau/katana/waybackurls")
+    parser.add_argument("-o", "--output", default="recon-output", help="Output directory")
+    parser.add_argument("--domain", help="Optional domain filter, e.g., example.com")
+    parser.add_argument("--top", type=int, default=20, help="Number of top priority URLs to save in report")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
+    parser.add_argument("--version", action="store_true", help="Show ReconLite version")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"ReconLite v{VERSION} by {AUTHOR}")
+        return
+
+    try:
+        if args.input:
+            urls = load_urls_from_file(args.input)
+        elif not sys.stdin.isatty():
+            urls = load_urls_from_stdin()
+        else:
+            parser.error("No input provided. Use -i urls.txt or pipe URLs into reconlite.")
+            return
+
+        results = classify_urls(urls, args.domain or "")
+        write_outputs(results, args.output, len(urls), args.domain or "", args.top)
+        print_summary(results, len(urls), args.output, args.no_color, min(args.top, 10))
+
+    except BrokenPipeError:
+        return
+    except Exception as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
