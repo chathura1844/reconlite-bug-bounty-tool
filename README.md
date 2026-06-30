@@ -27,6 +27,21 @@ ReconLite is a modular reconnaissance toolkit designed to automate the early sta
 
 ReconLite is intended for authorized security assessments, bug bounty programs, and learning web application reconnaissance techniques.
 
+bug-bounty
+reconnaissance
+cybersecurity
+penetration-testing
+recon
+web-security
+bash
+httpx
+katana
+bugbounty
+ethical-hacking
+osint
+security-tools
+automation
+
 
 
 
